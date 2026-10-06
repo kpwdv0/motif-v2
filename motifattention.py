@@ -79,20 +79,24 @@ def notes_to_token_ids(notes, tokenizer):
     midi = pretty_midi.PrettyMIDI()
     inst = pretty_midi.Instrument(program=0)
     offset = notes[0][0]
+
     for note in notes:
         start, end, pitch, velocity = note_fields(note)
         inst.notes.append(pretty_midi.Note(
             velocity=velocity, pitch=int(pitch), start=start - offset, end=end - offset
         ))
+
     midi.instruments.append(inst)
 
     with tempfile.NamedTemporaryFile(suffix=".midi", delete=False) as tmp:
         tmp_path = tmp.name
     midi.write(tmp_path)
+
     try:
         res = tokenizer.encode_from_file(tmp_path, return_tensors="pt")
     finally:
         os.remove(tmp_path)
+
     return res.input_ids  # (1, num_tokens)
 
 
@@ -109,12 +113,17 @@ def motif_notes_to_vector(motif_notes, tokenizer, model):
 
 def get_motif_vecs(example, tokenizer, model, max_motifs=3):
     vecs = []
-    for _, positions in list(example["motifs"].items())[:max_motifs]:
+    lens = example.get("motif_lens", {})  # claude's motifs aren't all 7 notes
+
+    for key, positions in list(example["motifs"].items())[:max_motifs]:
         pos = positions[0]
-        motif_notes = example["context"][pos:pos + MOTIF_LEN]
+        motif_notes = example["context"][pos:pos + lens.get(key, MOTIF_LEN)]
+
         if len(motif_notes) < 2:
             continue
+
         vecs.append(motif_notes_to_vector(motif_notes, tokenizer, model))
+
     return vecs
 
 
@@ -175,6 +184,7 @@ def train_one_epoch(model, patched_block, tokenizer, precomputed_dir, optimizer,
             (loss / accumulation_steps).backward()
 
             count += 1
+
             if count % accumulation_steps == 0:
                 optimizer.step()
                 optimizer.zero_grad()
@@ -228,6 +238,7 @@ def generate_continuation(model, tokenizer, patched_block, midi_path, num_tokens
 
 def run_ablation_sweep(base_model_name, tokenizer, precomputed_dir, layer_idx=14, examples_per_run=800):
     baseline = {"lr": 1e-5, "dropout": 0.0, "accum": 1}
+
     runs = [
         {**baseline, "name": "baseline"},
         {**baseline, "lr": 1e-6, "name": "lr_1e-6"},
@@ -244,6 +255,7 @@ def run_ablation_sweep(base_model_name, tokenizer, precomputed_dir, layer_idx=14
 
         # fresh model every run so they don't affect each other
         model = AutoModelForCausalLM.from_pretrained(base_model_name, trust_remote_code=True)
+
         for p in model.model.tok_embeddings.parameters():
             p.requires_grad = False
 
@@ -257,6 +269,7 @@ def run_ablation_sweep(base_model_name, tokenizer, precomputed_dir, layer_idx=14
             max_examples=examples_per_run, use_wandb=True, wandb_run_name=cfg["name"],
             accumulation_steps=cfg["accum"], checkpoint_path=f"checkpoint_{cfg['name']}.pt",
         )
+
         done.append(cfg["name"])
 
     print(f"\nall {len(done)} runs done: {done}")
@@ -265,11 +278,13 @@ def run_ablation_sweep(base_model_name, tokenizer, precomputed_dir, layer_idx=14
 
 def load_maestro_splits(csv_path):
     splits = {}
+
     with open(csv_path, encoding="utf-8") as f:
         for row in csv.DictReader(f):
             # csv has "2018/MIDI-....midi", the piece ids are "2018_MIDI-....midi"
             piece_id = row["midi_filename"].replace("/", "_")
             splits[piece_id] = row["split"]
+
     return splits
 
 
@@ -279,6 +294,7 @@ def group_index_by_split(precomputed_dir, splits):
 
     grouped = {"train": [], "validation": [], "test": []}
     unmatched = 0
+
     for entry in piece_index:
         split = splits.get(entry["piece_id"])
         if split in grouped:
@@ -289,6 +305,7 @@ def group_index_by_split(precomputed_dir, splits):
     print(f"grouped pieces: train={len(grouped['train'])}, "
           f"validation={len(grouped['validation'])}, test={len(grouped['test'])}, "
           f"unmatched={unmatched}")
+
     return grouped
 
 
@@ -327,12 +344,14 @@ def train_on_split_only(model, patched_block, tokenizer, optimizer, precomputed_
                 continue
 
             loss = lm_loss(model(input_ids)[0], input_ids)
+
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
 
             total_loss += loss.item()
             count += 1
+
             if count % 20 == 0:
                 print(f"train example {count}: loss={loss.item():.4f}")
 
@@ -393,7 +412,6 @@ def build_batch(examples, tokenizer, model, pad_token_id=PAD_ID, max_motifs=3, m
 
     for example in examples:
         motif_vecs = get_motif_vecs(example, tokenizer, model, max_motifs)
-
         full_notes = example["context"] + example["target"]
         try:
             ids = notes_to_token_ids(full_notes, tokenizer)[0, :max_seq_len]
@@ -411,8 +429,10 @@ def build_batch(examples, tokenizer, model, pad_token_id=PAD_ID, max_motifs=3, m
 
     n = len(all_ids)
     max_len = max(t.shape[0] for t in all_ids)
+
     padded_ids = torch.full((n, max_len), pad_token_id, dtype=torch.long)
     attention_mask = torch.zeros((n, max_len), dtype=torch.long)
+
     for i, t in enumerate(all_ids):
         padded_ids[i, :t.shape[0]] = t
         attention_mask[i, :t.shape[0]] = 1
@@ -422,6 +442,7 @@ def build_batch(examples, tokenizer, model, pad_token_id=PAD_ID, max_motifs=3, m
     hidden_dim = all_motifs[0].shape[1]
     padded_motifs = torch.zeros((n, max_motifs_in_batch, hidden_dim))
     motif_padding_mask = torch.ones((n, max_motifs_in_batch), dtype=torch.bool)
+
     for i, m in enumerate(all_motifs):
         padded_motifs[i, :m.shape[0]] = m
         motif_padding_mask[i, :m.shape[0]] = False  # True = padding
@@ -518,6 +539,7 @@ def train_with_epochs(model, patched_block, tokenizer, precomputed_dir, optimize
 def select_fixed_examples(precomputed_dir, splits, n=10, seed=42):
     # seeded so every run looks at the same examples
     import random
+
     rng = random.Random(seed)
 
     grouped = group_index_by_split(precomputed_dir, splits)
@@ -527,9 +549,11 @@ def select_fixed_examples(precomputed_dir, splits, n=10, seed=42):
         pieces = rng.sample(grouped[split], min(n, len(grouped[split])))
 
         chosen = []
+
         for entry in pieces:
             with open(os.path.join(precomputed_dir, entry["file"])) as f:
                 piece_examples = json.load(f)
+
             if piece_examples:
                 chosen.append({"piece_id": entry["piece_id"], "example": piece_examples[0]})
 
@@ -543,12 +567,14 @@ def plot_piano_roll(notes, title, save_path):
     import matplotlib.pyplot as plt
 
     fig, ax = plt.subplots(figsize=(12, 4))
+
     for note in notes:
         ax.plot([note[0], note[1]], [note[2], note[2]], linewidth=4, color="steelblue")
 
     ax.set_xlabel("time (s)")
     ax.set_ylabel("pitch")
     ax.set_title(title)
+
     plt.tight_layout()
     plt.savefig(save_path)
     plt.close(fig)
@@ -558,9 +584,11 @@ def plot_piano_roll(notes, title, save_path):
 def notes_to_midi(notes):
     midi = pretty_midi.PrettyMIDI()
     inst = pretty_midi.Instrument(program=0)
+
     for note in notes:
         start, end, pitch, velocity = note_fields(note)
         inst.notes.append(pretty_midi.Note(velocity=velocity, pitch=int(pitch), start=start, end=end))
+
     midi.instruments.append(inst)
     return midi
 
@@ -603,6 +631,7 @@ def visualize_example(example_entry, model, tokenizer, patched_block, output_dir
     with tempfile.NamedTemporaryFile(suffix=".mid", delete=False) as tmp:
         tmp_path = tmp.name
     mido_midi.save(tmp_path)
+
     try:
         gen_midi = pretty_midi.PrettyMIDI(tmp_path)
     finally:
@@ -654,10 +683,12 @@ def build_batch_token_concatenated(examples, pad_token_id=PAD_ID, max_seq_len=10
     # labels are -100 before the target so the loss only counts target tokens
     seqs = []
     target_starts = []
+
     for ex in examples:
         if ex is None:
             continue
         seq = ex["input_ids"][:max_seq_len]
+
         seqs.append(seq)
         target_starts.append(min(ex["target_start_index"], seq.shape[0]))
 
@@ -697,11 +728,13 @@ def train_token_concatenated(model, tokenizer, pieces, optimizer, num_epochs=1, 
             if ex is None:
                 continue
             batch_examples.append(ex)
+
             if len(batch_examples) < batch_size:
                 continue
 
             batch = build_batch_token_concatenated(batch_examples)
             batch_examples = []
+
             if batch is None:
                 continue
             input_ids, attention_mask, labels = batch
@@ -719,6 +752,7 @@ def train_token_concatenated(model, tokenizer, pieces, optimizer, num_epochs=1, 
 
             if use_wandb:
                 wandb.log({"loss": loss.item(), "epoch": epoch, "step": step})
+
             if step % 10 == 0:
                 print(f"step {step}: loss = {loss.item():.4f}")
 
